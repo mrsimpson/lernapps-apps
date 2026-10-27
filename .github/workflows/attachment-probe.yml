@@ -1,0 +1,129 @@
+name: Attachment probe
+
+# Test: Kann ein Workflow eine Datei laden, die ein Mensch an ein Issue oder einen Kommentar angehängt hat
+# (https://github.com/user-attachments/files/<id>/<name> oder .../assets/<uuid>)? Drei Abrufe je Adresse:
+#   a) ohne Anmeldung, b) mit dem Token des Workflows, c) ohne Anmeldung mit "Accept: application/octet-stream".
+# Das Ergebnis steht als Tabelle in einem Kommentar (je Issue oder Kommentar einer, an seinem Marker erkannt und
+# an Ort und Stelle aktualisiert). Dazu meldet er die Länge des Formularfelds "Inhalt".
+#
+# Nur ein Test: läuft nur für den Besitzer des Repos. Der Text aus Issues und Kommentaren geht nie in einen
+# Shell-Befehl, sondern nur über env: in eine Variable. Heruntergeladene Dateien werden nie ausgeführt und nie entpackt
+# (unzip -t prüft nur). Wird nach der Auswertung wieder gelöscht.
+on:
+  issues:
+    types: [opened, edited]
+  issue_comment:
+    types: [created, edited]
+
+permissions:
+  issues: write
+  contents: read
+
+concurrency:
+  group: attachment-probe-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    if: github.actor == github.repository_owner
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Probe the attachments
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          ISSUE: ${{ github.event.issue.number }}
+          SRC: ${{ github.event.comment.id && format('comment-{0}', github.event.comment.id) || 'issue' }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          BODY: ${{ github.event.comment.body || github.event.issue.body }}
+        run: |
+          set -u
+          export LC_ALL=C.UTF-8
+          work=$(mktemp -d)
+          printf '%s' "$BODY" > "$work/body.raw"
+          body_len=$(wc -m < "$work/body.raw" | tr -d ' ')
+          tr -d '\r' < "$work/body.raw" > "$work/body.txt"
+
+          # Das Formularfeld "Inhalt": der Abschnitt nach der Zeile "### Inhalt" bis zur nächsten "### "-Zeile.
+          awk '/^### /{ if (on) exit; on = ($0 == "### Inhalt") ? 1 : 0; next } on { print }' "$work/body.txt" \
+            | sed '1{/^$/d}' > "$work/inhalt.txt"
+          if grep -q '^### Inhalt$' "$work/body.txt"; then
+            inhalt_len=$(printf '%s' "$(cat "$work/inhalt.txt")" | wc -m | tr -d ' ')
+            inhalt_line="Das Feld »Inhalt« hat **$inhalt_len Zeichen** (der ganze Text: $body_len Zeichen; Grenze von GitHub etwa 65.536)."
+          else
+            inhalt_line="Kein Feld »Inhalt« in diesem Text (der ganze Text: $body_len Zeichen; Grenze von GitHub etwa 65.536)."
+          fi
+
+          grep -oE 'https://github\.com/user-attachments/(files|assets)/[^][:space:])"<>`]+' "$work/body.txt" \
+            | sed -E 's/[.,;:!?]+$//' | sort -u > "$work/urls.txt" || true
+
+          probe() { # mode url -> eine Tabellenzeile
+            local mode=$1 url=$2 f="$work/dl-$mode.bin" out code ctype size eff redirs hex kind host path
+            rm -f "$f"
+            local args=(-sS -L --max-time 60 --max-filesize 26214400 -o "$f"
+              -w '%{http_code}\t%{content_type}\t%{size_download}\t%{url_effective}\t%{num_redirects}')
+            case $mode in
+              a) ;;
+              b) args+=(-H "Authorization: Bearer $GH_TOKEN") ;;
+              c) args+=(-H "Accept: application/octet-stream") ;;
+            esac
+            out=$(curl "${args[@]}" "$url" 2> "$work/err-$mode.txt") || true
+            IFS=$'\t' read -r code ctype size eff redirs <<< "$out"
+            code=${code:-000}; ctype=${ctype:--}; size=${size:-0}; eff=${eff:-$url}; redirs=${redirs:-0}
+            hex=
+            [ -s "$f" ] && hex=$(od -An -tx1 -N4 "$f" | tr -d ' \n')
+            kind="leer"
+            if [ -s "$f" ]; then
+              if [ "$hex" = 504b0304 ]; then
+                if (cd "$(mktemp -d)" && unzip -tq "$f" > /dev/null 2>&1); then kind="ZIP, unzip -t ok"; else kind="ZIP-Kopf, unzip -t Fehler"; fi
+              elif [ "$(od -An -tx1 -N8 "$f" | tr -d ' \n')" = 89504e470d0a1a0a ]; then kind="PNG-Signatur ok"
+              elif head -c 200 "$f" | grep -qiE '<!doctype html|<html'; then kind="HTML-Seite"
+              else kind="anderes"; fi
+            fi
+            # Die Endadresse ohne Query (sie kann eine Signatur tragen): Host und Pfad.
+            host=${eff#*://}; host=${host%%/*}
+            path=${eff#*://}; path=${path#"$host"}; path=${path%%\?*}
+            printf '| %s | %s | %s | %s | %s | `%s` | %s | `%s%.40s` |\n' \
+              "$mode" "$code" "${ctype//|/}" "$size" "$redirs" "${hex:--}" "$kind" "$host" "$path"
+          }
+
+          marker="<!-- attachment-probe $SRC -->"
+          {
+            echo "$marker"
+            echo "### Anhang-Test"
+            echo
+            echo "Auslöser: $SRC. Lauf: $RUN_URL"
+            echo
+            echo "$inhalt_line"
+            echo
+            if [ -s "$work/urls.txt" ]; then
+              echo "Abrufe: **a** ohne Anmeldung, **b** mit dem Token des Workflows, **c** ohne Anmeldung mit \`Accept: application/octet-stream\`. Alle folgen Weiterleitungen (curl -L)."
+              while IFS= read -r url; do
+                echo
+                echo "Adresse: \`$url\`"
+                echo
+                echo "| Abruf | HTTP | Content-Type | Byte | Weiterl. | erste 4 Byte | Prüfung | Endadresse (Host und Pfad) |"
+                echo "|---|---|---|---|---|---|---|---|"
+                for m in a b c; do probe "$m" "$url"; done
+              done < "$work/urls.txt"
+            else
+              echo "Keine Anhänge gefunden."
+            fi
+            echo
+            echo "---"
+            echo "_Generated by [Claude Code](https://claude.ai/code)_"
+          } > "$work/comment.md"
+
+          cat "$work/comment.md" >> "$GITHUB_STEP_SUMMARY"
+
+          existing=$(gh api --paginate "repos/$REPO/issues/$ISSUE/comments?per_page=100" \
+            --jq '.[] | select(.user.login == "github-actions[bot]" and (.body | startswith("<!-- attachment-probe '"$SRC"' -->"))) | .id' \
+            | head -n 1)
+          if [ -n "$existing" ]; then
+            gh api --method PATCH "repos/$REPO/issues/comments/$existing" -F body=@"$work/comment.md" > /dev/null
+            echo "Kommentar $existing aktualisiert."
+          else
+            gh api --method POST "repos/$REPO/issues/$ISSUE/comments" -F body=@"$work/comment.md" > /dev/null
+            echo "Kommentar angelegt."
+          fi
