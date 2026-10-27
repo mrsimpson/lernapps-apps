@@ -59,7 +59,10 @@ jobs:
             | sed -E 's/[.,;:!?]+$//' | sort -u > "$work/urls.txt" || true
 
           probe() { # mode url -> eine Tabellenzeile
-            local mode=$1 url=$2 f="$work/dl-$mode.bin" out code ctype size eff redirs hex kind host path
+            local mode=$1
+            local url=$2
+            local f="$work/dl-$mode.bin"
+            local out code ctype size eff redirs hex kind host path
             rm -f "$f"
             local args=(-sS -L --max-time 60 --max-filesize 26214400 -o "$f"
               -w '%{http_code}\t%{content_type}\t%{size_download}\t%{url_effective}\t%{num_redirects}')
